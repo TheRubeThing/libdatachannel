@@ -1,6 +1,6 @@
 /**
  * Copyright (c) 2019-2020 Paul-Louis Ageneau
- * Copyright (c) 2020 Staz M
+ * Copyright (c) 2020 Staz Modrzynski
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -79,15 +79,13 @@ Description::Description(const string &sdp, Type type, Role role)
 	std::uniform_int_distribution<uint32_t> uniform;
 	mSessionId = std::to_string(uniform(generator));
 
-	int index = -1;
-	std::shared_ptr<Entry> current;
 	std::istringstream ss(sdp);
-	while (ss) {
-		string line;
-		std::getline(ss, line);
+	std::shared_ptr<Entry> current;
+
+	int index = -1;
+	string line;
+	while (std::getline(ss, line) || !line.empty()) {
 		trim_end(line);
-		if (line.empty())
-			continue;
 
 		// Media description line (aka m-line)
 		if (match_prefix(line, "m=")) {
@@ -132,13 +130,7 @@ Description::Description(const string &sdp, Type type, Role role)
 		} else if (current) {
 			current->parseSdpLine(std::move(line));
 		}
-	}
-
-	if (mIceUfrag.empty())
-		throw std::invalid_argument("Missing ice-ufrag parameter in SDP description");
-
-	if (mIcePwd.empty())
-		throw std::invalid_argument("Missing ice-pwd parameter in SDP description");
+	};
 }
 
 Description::Type Description::type() const { return mType; }
@@ -386,6 +378,7 @@ Description::Entry::Entry(const string &mline, string mid, Direction dir)
 	ss >> mType;
 	ss >> port; // ignored
 	ss >> mDescription;
+
 }
 
 void Description::Entry::setDirection(Direction dir) { mDirection = dir; }
@@ -453,6 +446,10 @@ void Description::Entry::parseSdpLine(string_view line) {
 	}
 }
 
+void Description::Media::addSSRC(uint32_t ssrc, std::string name) {
+    mAttributes.emplace_back("ssrc:" + std::to_string(ssrc) + " cname:" + name);
+}
+
 Description::Application::Application(string mid)
     : Entry("application 9 UDP/DTLS/SCTP", std::move(mid), Direction::SendRecv) {}
 
@@ -500,13 +497,9 @@ void Description::Application::parseSdpLine(string_view line) {
 
 Description::Media::Media(const string &sdp) : Entry(sdp, "", Direction::Unknown) {
 	std::istringstream ss(sdp);
-	while (ss) {
-		string line;
-		std::getline(ss, line);
+	string line;
+	while (std::getline(ss, line) || !line.empty()) {
 		trim_end(line);
-		if (line.empty())
-			continue;
-
 		parseSdpLine(line);
 	}
 
@@ -600,9 +593,10 @@ void Description::Media::removeFormat(const string &fmt) {
 	}
 }
 
-void Description::Media::addVideoCodec(int payloadType, const string &codec) {
+void Description::Video::addVideoCodec(int payloadType, const string &codec) {
 	RTPMap map(std::to_string(payloadType) + ' ' + codec + "/90000");
-	map.addFB("nack");
+    map.addFB("nack");
+    map.addFB("nack pli");
 	map.addFB("goog-remb");
 	if (codec == "H264") {
 		// Use Constrained Baseline profile Level 4.2 (necessary for Firefox)
@@ -610,14 +604,25 @@ void Description::Media::addVideoCodec(int payloadType, const string &codec) {
 		// TODO: Should be 42E0 but 42C0 appears to be more compatible. Investigate this.
 		map.fmtps.emplace_back("profile-level-id=42E02A;level-asymmetry-allowed=1");
 	}
-	mRtpMap.emplace(map.pt, map);
+	addRTPMap(map);
+
+	// RTX Packets
+    RTPMap rtx(std::to_string(payloadType+1) + " RTP/90000");
+    // TODO rtx-time is how long can a request be stashed for before needing to resend it. Needs to be parameterized
+    rtx.addFB("apt=" + std::to_string(payloadType) + ";rtx-time=3000");
 }
 
-void Description::Media::addH264Codec(int pt) { addVideoCodec(pt, "H264"); }
+void Description::Audio::addAudioCodec(int payloadType, const string &codec) {
+    // TODO This 48000/2 should be parameterized
+    RTPMap map(std::to_string(payloadType) + ' ' + codec + "/48000/2");
+    addRTPMap(map);
+}
 
-void Description::Media::addVP8Codec(int payloadType) { addVideoCodec(payloadType, "VP8"); }
+void Description::Video::addH264Codec(int pt) { addVideoCodec(pt, "H264"); }
 
-void Description::Media::addVP9Codec(int payloadType) { addVideoCodec(payloadType, "VP9"); }
+void Description::Video::addVP8Codec(int payloadType) { addVideoCodec(payloadType, "VP8"); }
+
+void Description::Video::addVP9Codec(int payloadType) { addVideoCodec(payloadType, "VP9"); }
 
 void Description::Media::setBitrate(int bitrate) { mBas = bitrate; }
 
@@ -692,6 +697,10 @@ void Description::Media::parseSdpLine(string_view line) {
 	}
 }
 
+void Description::Media::addRTPMap(const Description::Media::RTPMap& map) {
+    mRtpMap.emplace(map.pt, map);
+}
+
 Description::Media::RTPMap::RTPMap(string_view mline) {
 	size_t p = mline.find(' ');
 
@@ -710,7 +719,7 @@ Description::Media::RTPMap::RTPMap(string_view mline) {
 		this->clockRate = to_integer<int>(line);
 	else {
 		this->clockRate = to_integer<int>(line.substr(0, spl));
-		this->encParams = line.substr(spl);
+		this->encParams = line.substr(spl+1);
 	}
 }
 
@@ -728,6 +737,10 @@ void Description::Media::RTPMap::addFB(const string &str) { rtcpFbs.emplace_back
 
 Description::Audio::Audio(string mid, Direction dir)
     : Media("audio 9 UDP/TLS/RTP/SAVPF", std::move(mid), dir) {}
+
+void Description::Audio::addOpusCodec(int payloadType) {
+    addAudioCodec(payloadType, "OPUS");
+}
 
 Description::Video::Video(string mid, Direction dir)
     : Media("video 9 UDP/TLS/RTP/SAVPF", std::move(mid), dir) {}

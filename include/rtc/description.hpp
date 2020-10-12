@@ -1,6 +1,6 @@
 /**
  * Copyright (c) 2019-2020 Paul-Louis Ageneau
- * Copyright (c) 2020 Staz M
+ * Copyright (c) 2020 Staz Modrzynski
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -128,12 +128,9 @@ public:
 		string description() const override;
 		Media reciprocate() const;
 
-		void removeFormat(const string &fmt);
+        void removeFormat(const string &fmt);
 
-		void addVideoCodec(int payloadType, const string &codec);
-		void addH264Codec(int payloadType);
-		void addVP8Codec(int payloadType);
-		void addVP9Codec(int payloadType);
+        void addSSRC(uint32_t ssrc, std::string name);
 
 		void setBitrate(int bitrate);
 		int getBitrate() const;
@@ -142,40 +139,51 @@ public:
 
 		virtual void parseSdpLine(string_view line) override;
 
+        struct RTPMap {
+            RTPMap(string_view mline);
+
+            void removeFB(const string &string);
+            void addFB(const string &string);
+
+            int pt;
+            string format;
+            int clockRate;
+            string encParams;
+
+            std::vector<string> rtcpFbs;
+            std::vector<string> fmtps;
+        };
+
 	private:
 		virtual string generateSdpLines(string_view eol) const override;
 
 		int mBas = -1;
 
-		struct RTPMap {
-			RTPMap(string_view mline);
-
-			void removeFB(const string &string);
-			void addFB(const string &string);
-
-			int pt;
-			string format;
-			int clockRate;
-			string encParams;
-
-			std::vector<string> rtcpFbs;
-			std::vector<string> fmtps;
-		};
-
 		Media::RTPMap &getFormat(int fmt);
 		Media::RTPMap &getFormat(const string &fmt);
 
 		std::map<int, RTPMap> mRtpMap;
+
+	public:
+        void addRTPMap(const RTPMap& map);
 	};
 
 	class Audio : public Media {
 	public:
 		Audio(string mid = "audio", Direction dir = Direction::SendOnly);
+
+        void addAudioCodec(int payloadType, const string &codec);
+        void addOpusCodec(int payloadType);
 	};
 
 	class Video : public Media {
 	public:
 		Video(string mid = "video", Direction dir = Direction::SendOnly);
+
+        void addVideoCodec(int payloadType, const string &codec);
+        void addH264Codec(int payloadType);
+        void addVP8Codec(int payloadType);
+        void addVP9Codec(int payloadType);
 	};
 
 	bool hasApplication() const;
