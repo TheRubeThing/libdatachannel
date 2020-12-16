@@ -25,38 +25,59 @@
 
 namespace rtc {
 
-enum class CandidateType { Host = 0, ServerReflexive, PeerReflexive, Relayed };
-enum class CandidateTransportType { Udp = 0, TcpActive, TcpPassive, TcpSo };
-struct CandidateInfo {
-	string address;
-	int port;
-	CandidateType type;
-	CandidateTransportType transportType;
-};
-
-class Candidate {
+class RTC_CPP_EXPORT Candidate {
 public:
-	Candidate(string candidate, string mid = "");
+	enum class Family { Unresolved, Ipv4, Ipv6 };
+	enum class Type { Unknown, Host, ServerReflexive, PeerReflexive, Relayed };
+	enum class TransportType { Unknown, Udp, TcpActive, TcpPassive, TcpSo, TcpUnknown };
+
+	Candidate();
+	Candidate(string candidate);
+	Candidate(string candidate, string mid);
+
+	void hintMid(string mid);
 
 	enum class ResolveMode { Simple, Lookup };
 	bool resolve(ResolveMode mode = ResolveMode::Simple);
-	bool isResolved() const;
 
+	Type type() const;
+	TransportType transportType() const;
+	uint32_t priority() const;
 	string candidate() const;
 	string mid() const;
 	operator string() const;
 
+	bool operator==(const Candidate &other) const;
+	bool operator!=(const Candidate &other) const;
+
+	bool isResolved() const;
+	Family family() const;
+	std::optional<string> address() const;
+	std::optional<uint16_t> port() const;
+
 private:
-	string mCandidate;
-	string mMid;
-	bool mIsResolved;
+	void parse(string candidate);
+
+	string mFoundation;
+	uint32_t mComponent, mPriority;
+	string mTypeString, mTransportString;
+	Type mType;
+	TransportType mTransportType;
+	string mNode, mService;
+	string mTail;
+
+	std::optional<string> mMid;
+
+	// Extracted on resolution
+	Family mFamily;
+	string mAddress;
+	uint16_t mPort;
 };
 
 } // namespace rtc
 
-std::ostream &operator<<(std::ostream &out, const rtc::Candidate &candidate);
-std::ostream &operator<<(std::ostream &out, const rtc::CandidateType &type);
-std::ostream &operator<<(std::ostream &out, const rtc::CandidateTransportType &transportType);
+RTC_CPP_EXPORT std::ostream &operator<<(std::ostream &out, const rtc::Candidate &candidate);
+RTC_CPP_EXPORT std::ostream &operator<<(std::ostream &out, const rtc::Candidate::Type &type);
+RTC_CPP_EXPORT std::ostream &operator<<(std::ostream &out, const rtc::Candidate::TransportType &transportType);
 
 #endif
-

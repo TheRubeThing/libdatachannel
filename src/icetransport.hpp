@@ -20,8 +20,8 @@
 #define RTC_ICE_TRANSPORT_H
 
 #include "candidate.hpp"
-#include "description.hpp"
 #include "configuration.hpp"
+#include "description.hpp"
 #include "include.hpp"
 #include "peerconnection.hpp"
 #include "transport.hpp"
@@ -35,6 +35,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <mutex>
 
 namespace rtc {
 
@@ -45,8 +46,8 @@ public:
 	using candidate_callback = std::function<void(const Candidate &candidate)>;
 	using gathering_state_callback = std::function<void(GatheringState state)>;
 
-	IceTransport(const Configuration &config, Description::Role role,
-	             candidate_callback candidateCallback, state_callback stateChangeCallback,
+	IceTransport(const Configuration &config, candidate_callback candidateCallback,
+	             state_callback stateChangeCallback,
 	             gathering_state_callback gatheringStateChangeCallback);
 	~IceTransport();
 
@@ -55,7 +56,7 @@ public:
 	Description getLocalDescription(Description::Type type) const;
 	void setRemoteDescription(const Description &description);
 	bool addRemoteCandidate(const Candidate &candidate);
-	void gatherLocalCandidates();
+	void gatherLocalCandidates(string mid);
 
 	std::optional<string> getLocalAddress() const;
 	std::optional<string> getRemoteAddress() const;
@@ -63,9 +64,7 @@ public:
 	bool stop() override;
 	bool send(message_ptr message) override; // false if dropped
 
-#if USE_NICE
-	bool getSelectedCandidatePair(CandidateInfo *local, CandidateInfo *remote);
-#endif
+	bool getSelectedCandidatePair(Candidate *local, Candidate *remote);
 
 private:
 	bool outgoing(message_ptr message) override;
@@ -87,8 +86,6 @@ private:
 
 #if !USE_NICE
 	std::unique_ptr<juice_agent_t, void (*)(juice_agent_t *)> mAgent;
-	string mStunHostname;
-	string mStunService;
 
 	static void StateChangeCallback(juice_agent_t *agent, juice_state_t state, void *user_ptr);
 	static void CandidateCallback(juice_agent_t *agent, const char *sdp, void *user_ptr);
@@ -101,6 +98,8 @@ private:
 	std::unique_ptr<GMainLoop, void (*)(GMainLoop *)> mMainLoop;
 	std::thread mMainLoopThread;
 	guint mTimeoutId = 0;
+	std::mutex mOutgoingMutex;
+	unsigned int mOutgoingDscp;
 
 	static string AddressToString(const NiceAddress &addr);
 
@@ -113,9 +112,6 @@ private:
 	static gboolean TimeoutCallback(gpointer userData);
 	static void LogCallback(const gchar *log_domain, GLogLevelFlags log_level, const gchar *message,
 	                        gpointer user_data);
-	static CandidateType NiceTypeToCandidateType(NiceCandidateType type);
-	static CandidateTransportType
-	NiceTransportTypeToCandidateTransportType(NiceCandidateTransport type);
 #endif
 };
 

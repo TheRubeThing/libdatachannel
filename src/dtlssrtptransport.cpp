@@ -74,6 +74,7 @@ DtlsSrtpTransport::~DtlsSrtpTransport() {
 }
 
 bool DtlsSrtpTransport::sendMedia(message_ptr message) {
+	std::lock_guard lock(sendMutex);
 	if (!message)
 		return false;
 
@@ -82,7 +83,7 @@ bool DtlsSrtpTransport::sendMedia(message_ptr message) {
 		return false;
 	}
 
-	int size = message->size();
+	int size = int(message->size());
 	PLOG_VERBOSE << "Send size=" << size;
 
 	// The RTP header has a minimum size of 12 bytes
@@ -108,7 +109,7 @@ bool DtlsSrtpTransport::sendMedia(message_ptr message) {
 	if (value2 >= 64 && value2 <= 95) { // Range 64-95 (inclusive) MUST be RTCP
 		if (srtp_err_status_t err = srtp_protect_rtcp(mSrtpOut, message->data(), &size)) {
 			if (err == srtp_err_status_replay_fail)
-				throw std::runtime_error("SRTCP packet is a replay");
+				throw std::runtime_error("Outgoing SRTCP packet is a replay");
 			else
 				throw std::runtime_error("SRTCP protect error, status=" +
 				                         to_string(static_cast<int>(err)));
@@ -117,7 +118,7 @@ bool DtlsSrtpTransport::sendMedia(message_ptr message) {
 	} else {
 		if (srtp_err_status_t err = srtp_protect(mSrtpOut, message->data(), &size)) {
 			if (err == srtp_err_status_replay_fail)
-				throw std::runtime_error("SRTP packet is a replay");
+				throw std::runtime_error("Outgoing SRTP packet is a replay");
 			else
 				throw std::runtime_error("SRTP protect error, status=" +
 				                         to_string(static_cast<int>(err)));
@@ -126,8 +127,14 @@ bool DtlsSrtpTransport::sendMedia(message_ptr message) {
 	}
 
 	message->resize(size);
-	return outgoing(message);
-//	return DtlsTransport::send(message);
+
+	if (message->dscp == 0) { // Track might override the value
+		// Set recommended medium-priority DSCP value
+		// See https://tools.ietf.org/html/draft-ietf-tsvwg-rtcweb-qos-18
+		message->dscp = 36; // AF42: Assured Forwarding class 4, medium drop probability
+	}
+
+	return Transport::outgoing(message); // bypass DTLS DSCP marking
 }
 
 void DtlsSrtpTransport::incoming(message_ptr message) {
@@ -137,7 +144,7 @@ void DtlsSrtpTransport::incoming(message_ptr message) {
 		return;
 	}
 
-	int size = message->size();
+	int size = int(message->size());
 	if (size == 0)
 		return;
 
@@ -176,11 +183,13 @@ void DtlsSrtpTransport::incoming(message_ptr message) {
 					PLOG_WARNING << "Incoming SRTCP packet failed authentication check";
 				else
 					PLOG_WARNING << "SRTCP unprotect error, status=" << err;
+
 				return;
 			}
 			PLOG_VERBOSE << "Unprotected SRTCP packet, size=" << size;
 			message->type = Message::Type::Control;
-			message->stream = to_integer<uint8_t>(*(message->begin() + 1)); // Payload Type
+			message->stream = reinterpret_cast<RTCP_SR *>(message->data())->senderSSRC();
+
 		} else {
 			PLOG_VERBOSE << "Incoming SRTP packet, size=" << size;
 			if (srtp_err_status_t err = srtp_unprotect(mSrtpIn, message->data(), &size)) {
@@ -190,11 +199,12 @@ void DtlsSrtpTransport::incoming(message_ptr message) {
 					PLOG_WARNING << "Incoming SRTP packet failed authentication check";
 				else
 					PLOG_WARNING << "SRTP unprotect error, status=" << err;
+
 				return;
 			}
 			PLOG_VERBOSE << "Unprotected SRTP packet, size=" << size;
 			message->type = Message::Type::Binary;
-			message->stream = value2; // Payload Type
+			message->stream = reinterpret_cast<RTP *>(message->data())->ssrc();
 		}
 
 		message->resize(size);
@@ -208,6 +218,8 @@ void DtlsSrtpTransport::incoming(message_ptr message) {
 void DtlsSrtpTransport::postHandshake() {
 	if (mInitDone)
 		return;
+
+	static_assert(SRTP_AES_ICM_128_KEY_LEN_WSALT == SRTP_AES_128_KEY_LEN + SRTP_SALT_LEN);
 
 	const size_t materialLen = SRTP_AES_ICM_128_KEY_LEN_WSALT * 2;
 	unsigned char material[materialLen];
@@ -257,20 +269,19 @@ void DtlsSrtpTransport::postHandshake() {
 	serverSalt = clientSalt + SRTP_SALT_LEN;
 #endif
 
-	unsigned char clientSessionKey[SRTP_AES_ICM_128_KEY_LEN_WSALT];
-	std::memcpy(clientSessionKey, clientKey, SRTP_AES_128_KEY_LEN);
-	std::memcpy(clientSessionKey + SRTP_AES_128_KEY_LEN, clientSalt, SRTP_SALT_LEN);
+	std::memcpy(mClientSessionKey, clientKey, SRTP_AES_128_KEY_LEN);
+	std::memcpy(mClientSessionKey + SRTP_AES_128_KEY_LEN, clientSalt, SRTP_SALT_LEN);
 
-	unsigned char serverSessionKey[SRTP_AES_ICM_128_KEY_LEN_WSALT];
-	std::memcpy(serverSessionKey, serverKey, SRTP_AES_128_KEY_LEN);
-	std::memcpy(serverSessionKey + SRTP_AES_128_KEY_LEN, serverSalt, SRTP_SALT_LEN);
+	std::memcpy(mServerSessionKey, serverKey, SRTP_AES_128_KEY_LEN);
+	std::memcpy(mServerSessionKey + SRTP_AES_128_KEY_LEN, serverSalt, SRTP_SALT_LEN);
 
 	srtp_policy_t inbound = {};
 	srtp_crypto_policy_set_aes_cm_128_hmac_sha1_80(&inbound.rtp);
 	srtp_crypto_policy_set_aes_cm_128_hmac_sha1_80(&inbound.rtcp);
 	inbound.ssrc.type = ssrc_any_inbound;
-	inbound.ssrc.value = 0;
-	inbound.key = mIsClient ? serverSessionKey : clientSessionKey;
+	inbound.key = mIsClient ? mServerSessionKey : mClientSessionKey;
+	inbound.window_size = 1024;
+	inbound.allow_repeat_tx = true;
 	inbound.next = nullptr;
 
 	if (srtp_err_status_t err = srtp_add_stream(mSrtpIn, &inbound))
@@ -281,8 +292,9 @@ void DtlsSrtpTransport::postHandshake() {
 	srtp_crypto_policy_set_aes_cm_128_hmac_sha1_80(&outbound.rtp);
 	srtp_crypto_policy_set_aes_cm_128_hmac_sha1_80(&outbound.rtcp);
 	outbound.ssrc.type = ssrc_any_outbound;
-	outbound.ssrc.value = 0;
-	outbound.key = mIsClient ? clientSessionKey : serverSessionKey;
+	outbound.key = mIsClient ? mClientSessionKey : mServerSessionKey;
+	outbound.window_size = 1024;
+	outbound.allow_repeat_tx = true;
 	outbound.next = nullptr;
 
 	if (srtp_err_status_t err = srtp_add_stream(mSrtpOut, &outbound))

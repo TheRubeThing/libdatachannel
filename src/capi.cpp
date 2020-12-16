@@ -195,12 +195,42 @@ template <typename F> int wrap(F func) {
 		return RTC_ERR_SUCCESS;                                                                    \
 	})
 
-class plog_appender : public plog::IAppender {
-public:
-	plog_appender(rtcLogCallbackFunc cb = nullptr) { set_callback(cb); }
+int copyAndReturn(string s, char *buffer, int size) {
+	if (!buffer)
+		return int(s.size() + 1);
 
-	void set_callback(rtcLogCallbackFunc cb) {
-		std::lock_guard lock(mutex);
+	if (size < int(s.size()))
+		return RTC_ERR_TOO_SMALL;
+
+	std::copy(s.begin(), s.end(), buffer);
+	buffer[s.size()] = '\0';
+	return int(s.size() + 1);
+}
+
+int copyAndReturn(binary b, char *buffer, int size) {
+	if (!buffer)
+		return int(b.size());
+
+	if (size < int(b.size()))
+		return RTC_ERR_TOO_SMALL;
+
+	auto data = reinterpret_cast<const char *>(b.data());
+	std::copy(data, data + b.size(), buffer);
+	buffer[b.size()] = '\0';
+	return int(b.size());
+}
+
+class plogAppender : public plog::IAppender {
+public:
+	plogAppender(rtcLogCallbackFunc cb = nullptr) { setCallback(cb); }
+
+	plogAppender(plogAppender &&appender) : callback(nullptr) {
+		std::lock_guard lock(appender.callbackMutex);
+		std::swap(appender.callback, callback);
+	}
+
+	void setCallback(rtcLogCallbackFunc cb) {
+		std::lock_guard lock(callbackMutex);
 		callback = cb;
 	}
 
@@ -215,7 +245,7 @@ public:
 #else
 		std::string str = formatted;
 #endif
-		std::lock_guard lock(mutex);
+		std::lock_guard lock(callbackMutex);
 		if (callback)
 			callback(static_cast<rtcLogLevel>(record.getSeverity()), str.c_str());
 		else
@@ -224,18 +254,24 @@ public:
 
 private:
 	rtcLogCallbackFunc callback;
+	std::mutex callbackMutex;
 };
 
 } // namespace
 
 void rtcInitLogger(rtcLogLevel level, rtcLogCallbackFunc cb) {
-	static std::optional<plog_appender> appender;
-	if (appender)
-		appender->set_callback(cb);
-	else if (cb)
-		appender.emplace(plog_appender(cb));
-
-	InitLogger(static_cast<plog::Severity>(level), appender ? &appender.value() : nullptr);
+	static std::optional<plogAppender> appender;
+	const auto severity = static_cast<plog::Severity>(level);
+	std::lock_guard lock(mutex);
+	if (appender) {
+		appender->setCallback(cb);
+		InitLogger(severity, nullptr); // change the severity
+	} else if (cb) {
+		appender.emplace(plogAppender(cb));
+		InitLogger(severity, &appender.value());
+	} else {
+		InitLogger(severity, nullptr); // log to stdout
+	}
 }
 
 void rtcSetUserPointer(int i, void *ptr) { setUserPointer(i, ptr); }
@@ -268,45 +304,49 @@ int rtcDeletePeerConnection(int pc) {
 	});
 }
 
-int rtcAddDataChannel(int pc, const char *label) {
-	return rtcAddDataChannelExt(pc, label, nullptr, nullptr);
-}
+int rtcAddDataChannel(int pc, const char *label) { return rtcAddDataChannelEx(pc, label, nullptr); }
 
-int rtcAddDataChannelExt(int pc, const char *label, const char *protocol,
-                         const rtcReliability *reliability) {
+int rtcAddDataChannelEx(int pc, const char *label, const rtcDataChannelInit *init) {
 	return WRAP({
-		Reliability r = {};
-		if (reliability) {
-			r.unordered = reliability->unordered;
+		DataChannelInit dci = {};
+		if (init) {
+			auto *reliability = &init->reliability;
+			dci.reliability.unordered = reliability->unordered;
 			if (reliability->unreliable) {
 				if (reliability->maxPacketLifeTime > 0) {
-					r.type = Reliability::Type::Timed;
-					r.rexmit = milliseconds(reliability->maxPacketLifeTime);
+					dci.reliability.type = Reliability::Type::Timed;
+					dci.reliability.rexmit = milliseconds(reliability->maxPacketLifeTime);
 				} else {
-					r.type = Reliability::Type::Rexmit;
-					r.rexmit = int(reliability->maxRetransmits);
+					dci.reliability.type = Reliability::Type::Rexmit;
+					dci.reliability.rexmit = int(reliability->maxRetransmits);
 				}
 			} else {
-				r.type = Reliability::Type::Reliable;
+				dci.reliability.type = Reliability::Type::Reliable;
 			}
+
+			dci.negotiated = init->negotiated;
+			dci.id = init->manualStream ? std::make_optional(init->stream) : nullopt;
+			dci.protocol = init->protocol ? init->protocol : "";
 		}
+
 		auto peerConnection = getPeerConnection(pc);
-		int dc = emplaceDataChannel(peerConnection->addDataChannel(
-		    string(label ? label : ""), string(protocol ? protocol : ""), r));
+		int dc = emplaceDataChannel(
+		    peerConnection->addDataChannel(string(label ? label : ""), std::move(dci)));
+
 		if (auto ptr = getUserPointer(pc))
 			rtcSetUserPointer(dc, *ptr);
+
 		return dc;
 	});
 }
 
 int rtcCreateDataChannel(int pc, const char *label) {
-	return rtcCreateDataChannelExt(pc, label, nullptr, nullptr);
+	return rtcCreateDataChannelEx(pc, label, nullptr);
 }
 
-int rtcCreateDataChannelExt(int pc, const char *label, const char *protocol,
-                            const rtcReliability *reliability) {
-	int dc = rtcAddDataChannelExt(pc, label, protocol, reliability);
-	rtcSetLocalDescription(pc);
+int rtcCreateDataChannelEx(int pc, const char *label, const rtcDataChannelInit *init) {
+	int dc = rtcAddDataChannelEx(pc, label, init);
+	rtcSetLocalDescription(pc, NULL);
 	return dc;
 }
 
@@ -334,6 +374,7 @@ int rtcAddTrack(int pc, const char *mediaDescriptionSdp) {
 		int tr = emplaceTrack(peerConnection->addTrack(std::move(media)));
 		if (auto ptr = getUserPointer(pc))
 			rtcSetUserPointer(tr, *ptr);
+
 		return tr;
 	});
 }
@@ -355,19 +396,7 @@ int rtcDeleteTrack(int tr) {
 int rtcGetTrackDescription(int tr, char *buffer, int size) {
 	return WRAP({
 		auto track = getTrack(tr);
-
-		if (size <= 0)
-			return 0;
-
-		if (!buffer)
-			throw std::invalid_argument("Unexpected null pointer for buffer");
-
-		string description(track->description());
-		const char *data = description.data();
-		size = std::min(size - 1, int(description.size()));
-		std::copy(data, data + size, buffer);
-		buffer[size] = '\0';
-		return int(size + 1);
+		return copyAndReturn(track->description(), buffer, size);
 	});
 }
 
@@ -411,7 +440,7 @@ int rtcSetLocalDescriptionCallback(int pc, rtcDescriptionCallbackFunc cb) {
 		if (cb)
 			peerConnection->onLocalDescription([pc, cb](Description desc) {
 				if (auto ptr = getUserPointer(pc))
-					cb(string(desc).c_str(), desc.typeString().c_str(), *ptr);
+					cb(pc, string(desc).c_str(), desc.typeString().c_str(), *ptr);
 			});
 		else
 			peerConnection->onLocalDescription(nullptr);
@@ -424,7 +453,7 @@ int rtcSetLocalCandidateCallback(int pc, rtcCandidateCallbackFunc cb) {
 		if (cb)
 			peerConnection->onLocalCandidate([pc, cb](Candidate cand) {
 				if (auto ptr = getUserPointer(pc))
-					cb(cand.candidate().c_str(), cand.mid().c_str(), *ptr);
+					cb(pc, cand.candidate().c_str(), cand.mid().c_str(), *ptr);
 			});
 		else
 			peerConnection->onLocalCandidate(nullptr);
@@ -437,7 +466,7 @@ int rtcSetStateChangeCallback(int pc, rtcStateChangeCallbackFunc cb) {
 		if (cb)
 			peerConnection->onStateChange([pc, cb](PeerConnection::State state) {
 				if (auto ptr = getUserPointer(pc))
-					cb(static_cast<rtcState>(state), *ptr);
+					cb(pc, static_cast<rtcState>(state), *ptr);
 			});
 		else
 			peerConnection->onStateChange(nullptr);
@@ -450,7 +479,20 @@ int rtcSetGatheringStateChangeCallback(int pc, rtcGatheringStateCallbackFunc cb)
 		if (cb)
 			peerConnection->onGatheringStateChange([pc, cb](PeerConnection::GatheringState state) {
 				if (auto ptr = getUserPointer(pc))
-					cb(static_cast<rtcGatheringState>(state), *ptr);
+					cb(pc, static_cast<rtcGatheringState>(state), *ptr);
+			});
+		else
+			peerConnection->onGatheringStateChange(nullptr);
+	});
+}
+
+int rtcSetSignalingStateChangeCallback(int pc, rtcSignalingStateCallbackFunc cb) {
+	return WRAP({
+		auto peerConnection = getPeerConnection(pc);
+		if (cb)
+			peerConnection->onSignalingStateChange([pc, cb](PeerConnection::SignalingState state) {
+				if (auto ptr = getUserPointer(pc))
+					cb(pc, static_cast<rtcSignalingState>(state), *ptr);
 			});
 		else
 			peerConnection->onGatheringStateChange(nullptr);
@@ -465,7 +507,7 @@ int rtcSetDataChannelCallback(int pc, rtcDataChannelCallbackFunc cb) {
 				int dc = emplaceDataChannel(dataChannel);
 				if (auto ptr = getUserPointer(pc)) {
 					rtcSetUserPointer(dc, *ptr);
-					cb(dc, *ptr);
+					cb(pc, dc, *ptr);
 				}
 			});
 		else
@@ -481,7 +523,7 @@ int rtcSetTrackCallback(int pc, rtcTrackCallbackFunc cb) {
 				int tr = emplaceTrack(track);
 				if (auto ptr = getUserPointer(pc)) {
 					rtcSetUserPointer(tr, *ptr);
-					cb(tr, *ptr);
+					cb(pc, tr, *ptr);
 				}
 			});
 		else
@@ -489,10 +531,11 @@ int rtcSetTrackCallback(int pc, rtcTrackCallbackFunc cb) {
 	});
 }
 
-int rtcSetLocalDescription(int pc) {
+int rtcSetLocalDescription(int pc, const char *type) {
 	return WRAP({
 		auto peerConnection = getPeerConnection(pc);
-		peerConnection->setLocalDescription();
+		peerConnection->setLocalDescription(type ? Description::stringToType(type)
+		                                         : Description::Type::Unspec);
 	});
 }
 
@@ -518,23 +561,36 @@ int rtcAddRemoteCandidate(int pc, const char *cand, const char *mid) {
 	});
 }
 
+int rtcGetLocalDescription(int pc, char *buffer, int size) {
+	return WRAP({
+		auto peerConnection = getPeerConnection(pc);
+
+		if (auto desc = peerConnection->localDescription())
+			return copyAndReturn(string(*desc), buffer, size);
+		else
+			return RTC_ERR_NOT_AVAIL;
+	});
+}
+
+int rtcGetRemoteDescription(int pc, char *buffer, int size) {
+	return WRAP({
+		auto peerConnection = getPeerConnection(pc);
+
+		if (auto desc = peerConnection->remoteDescription())
+			return copyAndReturn(string(*desc), buffer, size);
+		else
+			return RTC_ERR_NOT_AVAIL;
+	});
+}
+
 int rtcGetLocalAddress(int pc, char *buffer, int size) {
 	return WRAP({
 		auto peerConnection = getPeerConnection(pc);
 
-		if (size <= 0)
-			return 0;
-
-		if (!buffer)
-			throw std::invalid_argument("Unexpected null pointer for buffer");
-
-		if (auto addr = peerConnection->localAddress()) {
-			const char *data = addr->data();
-			size = std::min(size - 1, int(addr->size()));
-			std::copy(data, data + size, buffer);
-			buffer[size] = '\0';
-			return size + 1;
-		}
+		if (auto addr = peerConnection->localAddress())
+			return copyAndReturn(std::move(*addr), buffer, size);
+		else
+			return RTC_ERR_NOT_AVAIL;
 	});
 }
 
@@ -542,57 +598,52 @@ int rtcGetRemoteAddress(int pc, char *buffer, int size) {
 	return WRAP({
 		auto peerConnection = getPeerConnection(pc);
 
-		if (size <= 0)
-			return 0;
+		if (auto addr = peerConnection->remoteAddress())
+			return copyAndReturn(std::move(*addr), buffer, size);
+		else
+			return RTC_ERR_NOT_AVAIL;
+	});
+}
 
-		if (!buffer)
-			throw std::invalid_argument("Unexpected null pointer for buffer");
+int rtcGetSelectedCandidatePair(int pc, char *local, int localSize, char *remote, int remoteSize) {
+	return WRAP({
+		auto peerConnection = getPeerConnection(pc);
 
-		if (auto addr = peerConnection->remoteAddress()) {
-			const char *data = addr->data();
-			size = std::min(size - 1, int(addr->size()));
-			std::copy(data, data + size, buffer);
-			buffer[size] = '\0';
-			return int(size + 1);
-		}
+		Candidate localCand;
+		Candidate remoteCand;
+		if (!peerConnection->getSelectedCandidatePair(&localCand, &remoteCand))
+			return RTC_ERR_NOT_AVAIL;
+
+		int localRet = copyAndReturn(string(localCand), local, localSize);
+		if (localRet < 0)
+			return localRet;
+
+		int remoteRet = copyAndReturn(string(remoteCand), remote, remoteSize);
+		if (remoteRet < 0)
+			return remoteRet;
+
+		return std::max(localRet, remoteRet);
+	});
+}
+
+int rtcGetDataChannelStream(int dc) {
+	return WRAP({
+		auto dataChannel = getDataChannel(dc);
+		return int(dataChannel->id());
 	});
 }
 
 int rtcGetDataChannelLabel(int dc, char *buffer, int size) {
 	return WRAP({
 		auto dataChannel = getDataChannel(dc);
-
-		if (size <= 0)
-			return 0;
-
-		if (!buffer)
-			throw std::invalid_argument("Unexpected null pointer for buffer");
-
-		string label = dataChannel->label();
-		const char *data = label.data();
-		size = std::min(size - 1, int(label.size()));
-		std::copy(data, data + size, buffer);
-		buffer[size] = '\0';
-		return int(size + 1);
+		return copyAndReturn(dataChannel->label(), buffer, size);
 	});
 }
 
 int rtcGetDataChannelProtocol(int dc, char *buffer, int size) {
 	return WRAP({
 		auto dataChannel = getDataChannel(dc);
-
-		if (size <= 0)
-			return 0;
-
-		if (!buffer)
-			throw std::invalid_argument("Unexpected null pointer for buffer");
-
-		string protocol = dataChannel->protocol();
-		const char *data = protocol.data();
-		size = std::min(size - 1, int(protocol.size()));
-		std::copy(data, data + size, buffer);
-		buffer[size] = '\0';
-		return int(size + 1);
+		return copyAndReturn(dataChannel->protocol(), buffer, size);
 	});
 }
 
@@ -603,19 +654,19 @@ int rtcGetDataChannelReliability(int dc, rtcReliability *reliability) {
 		if (!reliability)
 			throw std::invalid_argument("Unexpected null pointer for reliability");
 
-		Reliability r = dataChannel->reliability();
+		Reliability dcr = dataChannel->reliability();
 		std::memset(reliability, 0, sizeof(*reliability));
-		reliability->unordered = r.unordered;
-		if (r.type == Reliability::Type::Timed) {
+		reliability->unordered = dcr.unordered;
+		if (dcr.type == Reliability::Type::Timed) {
 			reliability->unreliable = true;
-			reliability->maxPacketLifeTime = unsigned(std::get<milliseconds>(r.rexmit).count());
-		} else if (r.type == Reliability::Type::Rexmit) {
+			reliability->maxPacketLifeTime = unsigned(std::get<milliseconds>(dcr.rexmit).count());
+		} else if (dcr.type == Reliability::Type::Rexmit) {
 			reliability->unreliable = true;
-			reliability->maxRetransmits = unsigned(std::get<int>(r.rexmit));
+			reliability->maxRetransmits = unsigned(std::get<int>(dcr.rexmit));
 		} else {
 			reliability->unreliable = false;
 		}
-		return 0;
+		return RTC_ERR_SUCCESS;
 	});
 }
 
@@ -625,7 +676,7 @@ int rtcSetOpenCallback(int id, rtcOpenCallbackFunc cb) {
 		if (cb)
 			channel->onOpen([id, cb]() {
 				if (auto ptr = getUserPointer(id))
-					cb(*ptr);
+					cb(id, *ptr);
 			});
 		else
 			channel->onOpen(nullptr);
@@ -638,7 +689,7 @@ int rtcSetClosedCallback(int id, rtcClosedCallbackFunc cb) {
 		if (cb)
 			channel->onClosed([id, cb]() {
 				if (auto ptr = getUserPointer(id))
-					cb(*ptr);
+					cb(id, *ptr);
 			});
 		else
 			channel->onClosed(nullptr);
@@ -651,7 +702,7 @@ int rtcSetErrorCallback(int id, rtcErrorCallbackFunc cb) {
 		if (cb)
 			channel->onError([id, cb](string error) {
 				if (auto ptr = getUserPointer(id))
-					cb(error.c_str(), *ptr);
+					cb(id, error.c_str(), *ptr);
 			});
 		else
 			channel->onError(nullptr);
@@ -665,11 +716,11 @@ int rtcSetMessageCallback(int id, rtcMessageCallbackFunc cb) {
 			channel->onMessage(
 			    [id, cb](binary b) {
 				    if (auto ptr = getUserPointer(id))
-					    cb(reinterpret_cast<const char *>(b.data()), int(b.size()), *ptr);
+					    cb(id, reinterpret_cast<const char *>(b.data()), int(b.size()), *ptr);
 			    },
 			    [id, cb](string s) {
 				    if (auto ptr = getUserPointer(id))
-					    cb(s.c_str(), -int(s.size() + 1), *ptr);
+					    cb(id, s.c_str(), -int(s.size() + 1), *ptr);
 			    });
 		else
 			channel->onMessage(nullptr);
@@ -716,7 +767,7 @@ int rtcSetBufferedAmountLowCallback(int id, rtcBufferedAmountLowCallbackFunc cb)
 		if (cb)
 			channel->onBufferedAmountLow([id, cb]() {
 				if (auto ptr = getUserPointer(id))
-					cb(*ptr);
+					cb(id, *ptr);
 			});
 		else
 			channel->onBufferedAmountLow(nullptr);
@@ -731,12 +782,12 @@ int rtcSetAvailableCallback(int id, rtcAvailableCallbackFunc cb) {
 	return WRAP({
 		auto channel = getChannel(id);
 		if (cb)
-			channel->onOpen([id, cb]() {
+			channel->onAvailable([id, cb]() {
 				if (auto ptr = getUserPointer(id))
-					cb(*ptr);
+					cb(id, *ptr);
 			});
 		else
-			channel->onOpen(nullptr);
+			channel->onAvailable(nullptr);
 	});
 }
 
@@ -747,34 +798,38 @@ int rtcReceiveMessage(int id, char *buffer, int *size) {
 		if (!size)
 			throw std::invalid_argument("Unexpected null pointer for size");
 
-		if (!buffer && *size != 0)
-			throw std::invalid_argument("Unexpected null pointer for buffer");
+		*size = std::abs(*size);
 
-		if (auto message = channel->receive())
-			return std::visit( //
-			    overloaded{    //
-			               [&](binary b) {
-				               if (*size > 0) {
-					               *size = std::min(*size, int(b.size()));
-					               auto data = reinterpret_cast<const char *>(b.data());
-					               std::copy(data, data + *size, buffer);
-				               }
-				               return 1;
-			               },
-			               [&](string s) {
-				               if (*size > 0) {
-					               int len = std::min(*size - 1, int(s.size()));
-					               if (len >= 0) {
-						               std::copy(s.data(), s.data() + len, buffer);
-						               buffer[len] = '\0';
-					               }
-					               *size = -(len + 1);
-				               }
-				               return 1;
-			               }},
-			    *message);
-		else
-			return 0;
+		auto message = channel->peek();
+		if (!message)
+			return RTC_ERR_NOT_AVAIL;
+
+		return std::visit( //
+		    overloaded{
+		        [&](binary b) {
+			        int ret = copyAndReturn(std::move(b), buffer, *size);
+			        if (ret >= 0) {
+				        channel->receive(); // discard
+				        *size = ret;
+				        return RTC_ERR_SUCCESS;
+			        } else {
+				        *size = int(b.size());
+				        return ret;
+			        }
+		        },
+		        [&](string s) {
+			        int ret = copyAndReturn(std::move(s), buffer, *size);
+			        if (ret >= 0) {
+				        channel->receive(); // discard
+				        *size = -ret;
+				        return RTC_ERR_SUCCESS;
+			        } else {
+				        *size = -int(s.size() + 1);
+				        return ret;
+			        }
+		        },
+		    },
+		    *message);
 	});
 }
 

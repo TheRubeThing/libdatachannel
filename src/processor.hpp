@@ -22,6 +22,7 @@
 #include "include.hpp"
 #include "init.hpp"
 #include "threadpool.hpp"
+#include "queue.hpp"
 
 #include <condition_variable>
 #include <future>
@@ -34,7 +35,7 @@ namespace rtc {
 // Processed tasks in order by delegating them to the thread pool
 class Processor final {
 public:
-	Processor() = default;
+	Processor(size_t limit = 0);
 	~Processor();
 
 	Processor(const Processor &) = delete;
@@ -44,8 +45,7 @@ public:
 
 	void join();
 
-	template <class F, class... Args>
-	auto enqueue(F &&f, Args &&... args) -> invoke_future_t<F, Args...>;
+	template <class F, class... Args> void enqueue(F &&f, Args &&... args);
 
 protected:
 	void schedule();
@@ -53,38 +53,27 @@ protected:
 	// Keep an init token
 	const init_token mInitToken = Init::Token();
 
-	std::queue<std::function<void()>> mTasks;
+	Queue<std::function<void()>> mTasks;
 	bool mPending = false; // true iff a task is pending in the thread pool
 
 	mutable std::mutex mMutex;
 	std::condition_variable mCondition;
 };
 
-template <class F, class... Args>
-auto Processor::enqueue(F &&f, Args &&... args) -> invoke_future_t<F, Args...> {
+template <class F, class... Args> void Processor::enqueue(F &&f, Args &&... args) {
 	std::unique_lock lock(mMutex);
-	using R = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>;
-	auto task = std::make_shared<std::packaged_task<R()>>(
-	    std::bind(std::forward<F>(f), std::forward<Args>(args)...));
-	std::future<R> result = task->get_future();
-
-	auto bundle = [this, task = std::move(task)]() {
-		try {
-			(*task)();
-		} catch (const std::exception &e) {
-			PLOG_WARNING << "Unhandled exception in task: " << e.what();
-		}
-		schedule(); // chain the next task
+	auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+	auto task = [this, bound = std::move(bound)]() mutable {
+		scope_guard guard(std::bind(&Processor::schedule, this)); // chain the next task
+		return bound();
 	};
 
 	if (!mPending) {
-		ThreadPool::Instance().enqueue(std::move(bundle));
+		ThreadPool::Instance().enqueue(std::move(task));
 		mPending = true;
 	} else {
-		mTasks.emplace(std::move(bundle));
+		mTasks.push(std::move(task));
 	}
-
-	return result;
 }
 
 } // namespace rtc

@@ -24,7 +24,13 @@
 
 #if RTC_ENABLE_MEDIA
 
+#if RTC_SYSTEM_SRTP
 #include <srtp2/srtp.h>
+#else
+#include "srtp.h"
+#endif
+
+#include <atomic>
 
 namespace rtc {
 
@@ -47,7 +53,11 @@ private:
 	message_callback mSrtpRecvCallback;
 
 	srtp_t mSrtpIn, mSrtpOut;
-	bool mInitDone = false;
+
+	std::atomic<bool> mInitDone = false;
+	unsigned char mClientSessionKey[SRTP_AES_ICM_128_KEY_LEN_WSALT];
+	unsigned char mServerSessionKey[SRTP_AES_ICM_128_KEY_LEN_WSALT];
+	std::mutex sendMutex;
 };
 
 } // namespace rtc
