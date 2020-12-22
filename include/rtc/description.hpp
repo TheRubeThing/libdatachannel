@@ -138,7 +138,7 @@ public:
 		string description() const override;
 		Media reciprocate() const;
 
-        void removeFormat(const string &fmt);
+		void removeFormat(const string &fmt);
 
 		void addSSRC(uint32_t ssrc, std::optional<string> name,
 		             std::optional<string> msid = nullopt);
@@ -165,8 +165,10 @@ public:
 			void addFB(const string &string);
 			void addAttribute(string attr) { fmtps.emplace_back(std::move(attr)); }
 
-	private:
-		virtual string generateSdpLines(string_view eol) const override;
+			int pt;
+			string format;
+			int clockRate;
+			string encParams;
 
 			std::vector<string> rtcpFbs;
 			std::vector<string> fmtps;

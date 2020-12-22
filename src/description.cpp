@@ -73,12 +73,12 @@ Description::Description(const string &sdp, Type type, Role role)
 	int index = -1;
 	std::shared_ptr<Entry> current;
 	std::istringstream ss(sdp);
-	std::shared_ptr<Entry> current;
-
-	int index = -1;
-	string line;
-	while (std::getline(ss, line) || !line.empty()) {
+	while (ss) {
+		string line;
+		std::getline(ss, line);
 		trim_end(line);
+		if (line.empty())
+			continue;
 
 		if (match_prefix(line, "m=")) { // Media description line (aka m-line)
 			current = createEntry(line.substr(2), std::to_string(++index), Direction::Unknown);
@@ -444,7 +444,6 @@ Description::Entry::Entry(const string &mline, string mid, Direction dir)
 	ss >> mType;
 	ss >> port; // ignored
 	ss >> mDescription;
-
 }
 
 void Description::Entry::setDirection(Direction dir) { mDirection = dir; }
@@ -558,10 +557,6 @@ bool Description::Media::hasSSRC(uint32_t ssrc) {
 	return std::find(mSsrcs.begin(), mSsrcs.end(), ssrc) != mSsrcs.end();
 }
 
-void Description::Media::addSSRC(uint32_t ssrc, std::string name) {
-    mAttributes.emplace_back("ssrc:" + std::to_string(ssrc) + " cname:" + name);
-}
-
 Description::Application::Application(string mid)
     : Entry("application 9 UDP/DTLS/SCTP", std::move(mid), Direction::SendRecv) {}
 
@@ -609,9 +604,13 @@ void Description::Application::parseSdpLine(string_view line) {
 
 Description::Media::Media(const string &sdp) : Entry(sdp, "", Direction::Unknown) {
 	std::istringstream ss(sdp);
-	string line;
-	while (std::getline(ss, line) || !line.empty()) {
+	while (ss) {
+		string line;
+		std::getline(ss, line);
 		trim_end(line);
+		if (line.empty())
+			continue;
+
 		parseSdpLine(line);
 	}
 
